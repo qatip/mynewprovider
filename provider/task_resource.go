@@ -24,6 +24,13 @@ type taskModel struct {
 	Completed   types.Bool   `tfsdk:"completed"`
 }
 
+type Task struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Completed   bool   `json:"completed"`
+}
+
 func NewTaskResource() resource.Resource {
 	return &taskResource{}
 }
@@ -100,41 +107,91 @@ func (r *taskResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 	}
 
 	var task map[string]interface{}
-	json.NewDecoder(res.Body).Decode(&task)
+	if err := json.NewDecoder(res.Body).Decode(&task); err != nil {
+		resp.Diagnostics.AddError("Decode Failed", err.Error())
+		return
+	}
 
-	data.Title = types.StringValue(task["title"].(string))
-	data.Description = types.StringValue(task["description"].(string))
-	data.Completed = types.BoolValue(task["completed"].(bool))
+	if v, ok := task["title"].(string); ok {
+		data.Title = types.StringValue(v)
+	} else {
+		data.Title = types.StringNull()
+	}
+
+	if v, ok := task["description"].(string); ok {
+		data.Description = types.StringValue(v)
+	} else {
+		data.Description = types.StringNull()
+	}
+
+	if v, ok := task["completed"].(bool); ok {
+		data.Completed = types.BoolValue(v)
+	} else {
+		data.Completed = types.BoolNull()
+	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
 func (r *taskResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var data taskModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	var plan taskModel
+	var state taskModel
+
+	// Read the Terraform plan values
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	task := map[string]interface{}{
-		"title":       data.Title.ValueString(),
-		"description": data.Description.ValueString(),
-		"completed":   data.Completed.ValueBool(),
-	}
-
-	body, _ := json.Marshal(task)
-	reqURL := fmt.Sprintf("http://localhost:8080/tasks/%s", data.ID.ValueString())
-	reqPut, _ := http.NewRequest(http.MethodPut, reqURL, bytes.NewBuffer(body))
-	reqPut.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	_, err := client.Do(reqPut)
-	if err != nil {
-		resp.Diagnostics.AddError("Update Failed", err.Error())
+	// Read the current Terraform state
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+	// Construct the updated task from the plan
+	task := Task{
+		ID:          state.ID.ValueString(), // Preserve existing ID
+		Title:       plan.Title.ValueString(),
+		Description: plan.Description.ValueString(),
+		Completed:   plan.Completed.ValueBool(),
+	}
+
+	// Marshal task to JSON
+	data, err := json.Marshal(task)
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to marshal task data: %s", err))
+		return
+	}
+
+	// Make PUT request
+	reqURL := fmt.Sprintf("http://localhost:8080/tasks/%s", task.ID)
+	httpReq, err := http.NewRequest(http.MethodPut, reqURL, bytes.NewBuffer(data))
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create update request: %s", err))
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Error sending update request: %s", err))
+		return
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(httpResp.Body)
+		resp.Diagnostics.AddError("API Error", fmt.Sprintf("Unexpected status code: %d\nBody: %s", httpResp.StatusCode, string(body)))
+		return
+	}
+
+	// Preserve ID from state (if not returned by API)
+	plan.ID = state.ID
+
+	// Save updated state
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *taskResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
